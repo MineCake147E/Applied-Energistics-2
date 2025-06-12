@@ -340,6 +340,9 @@ public class IOPortBlockEntity extends AENetworkedInvBlockEntity
                     if (inserted > 0) {
                         movedItem = Math.max(1, inserted / key.getAmountPerOperation());
                     }
+                } else {
+                    // Negative value indicates the source couldn't extract anything.
+                    return -1;
                 }
             }
         }
@@ -380,17 +383,17 @@ public class IOPortBlockEntity extends AENetworkedInvBlockEntity
     }
 
     private TickRateModulation fillCells(IGrid grid, long itemsToMove, TickRateModulation tickRateModulation) {
+        if (itemsToMove <= 0) return tickRateModulation;
         var networkInv = grid.getStorageService().getInventory();
         KeyCounter srcList = grid.getStorageService().getCachedInventory();
-        KeyCounter dstList = null;
-        int movedTypes = 0;
+        KeyCounter dstList;
+        long movedTypes = 0;
         boolean isUrgent = false;
         var energy = grid.getEnergyService();
         // The fastest way to manage <65 flags is to use primitive integer types
         long cellFlags = 0;
         Objects.checkIndex(NUMBER_OF_CELL_SLOTS, Long.SIZE);
-        ArrayList<AbstractInt2ObjectMap.BasicEntry<StorageCell>> typeFilledCells = new ArrayList<>();
-        ArrayList<AbstractInt2ObjectMap.BasicEntry<BasicCellInventory>> whitelistedCells = new ArrayList<>();
+        ArrayList<AbstractInt2ObjectMap.BasicEntry<StorageCell>> filteredCells = new ArrayList<>();
         ArrayList<AbstractInt2ObjectMap.BasicEntry<StorageCell>> cells = new ArrayList<>();
         for (int i = 0; i < NUMBER_OF_CELL_SLOTS; i++) {
             var cell = this.inputCells.getStackInSlot(i);
@@ -411,7 +414,7 @@ public class IOPortBlockEntity extends AENetworkedInvBlockEntity
                     continue;
                 }
                 case TYPES_FULL -> {
-                    typeFilledCells.add(new AbstractInt2ObjectMap.BasicEntry<>(i, cellInv));
+                    filteredCells.add(new AbstractInt2ObjectMap.BasicEntry<>(i, cellInv));
                     continue;
                 }
             }
@@ -422,58 +425,78 @@ public class IOPortBlockEntity extends AENetworkedInvBlockEntity
                 }
                 if (basicCellInventory.isPreformatted()
                         && basicCellInventory.getPartitionListMode() == IncludeExclude.WHITELIST) {
-                    whitelistedCells.add(new AbstractInt2ObjectMap.BasicEntry<>(i, basicCellInventory));
+                    filteredCells.add(new AbstractInt2ObjectMap.BasicEntry<>(i, basicCellInventory));
                     continue;
                 }
             }
             cells.add(new AbstractInt2ObjectMap.BasicEntry<>(i, cellInv));
         }
-        if (cells.isEmpty() && whitelistedCells.isEmpty() && typeFilledCells.isEmpty())
+        if (cells.isEmpty() && filteredCells.isEmpty())
             return tickRateModulation;
-        if (!whitelistedCells.isEmpty()) {
+        ArrayList<AbstractInt2ObjectMap.BasicEntry<StorageCell>> checkedCells = null;
+        if (!filteredCells.isEmpty()) {
             dstList = new KeyCounter();
+            KeyCounter filterList = null;
             int i = 0;
-            while (itemsToMove > 0 && movedTypes < TRANSFER_TYPES_PER_TICK && i < whitelistedCells.size()) {
-                var cell = whitelistedCells.get(i);
+            while (itemsToMove > 0 && movedTypes < TRANSFER_TYPES_PER_TICK && i < filteredCells.size()) {
+                var cell = filteredCells.get(i);
                 var slot = cell.getIntKey();
                 var cellInv = cell.getValue();
-                var limitToAdd = cellInv instanceof BasicCellInventory basicCellInventory
-                        ? basicCellInventory.getRemainingItemTypes()
-                        : 0;
-                limitToAdd = Math.max(63, limitToAdd);
-                if (cellInv.filterMatches(srcList, dstList, movedTypes + limitToAdd)) {
-                    for (var entry : dstList) {
-                        var what = entry.getKey();
-                        var totalStackSize = entry.getLongValue();
-                        if (totalStackSize > 0) {
-                            var movable = Math.min(totalStackSize, itemsToMove);
-                            var cellMovedItems = transferEntryToCell(what, networkInv, cellInv, movable, energy,
-                                    this.mySrc);
-                            itemsToMove -= cellMovedItems;
-                            movedTypes += cellMovedItems > 0 ? 1 : 0;
-                            if (cellMovedItems > 0) {
-                                cellFlags |= 1L << slot;
+                boolean cellRemoved = false;
+                boolean filterSuccess;
+                boolean typeFiltered = false;
+                if (cellInv instanceof BasicCellInventory basicCellInventory && basicCellInventory.canHoldNewItem()) {
+                    filterSuccess = basicCellInventory.filterMatches(srcList, dstList, movedTypes + 63);
+                } else {
+                    typeFiltered = true;
+                    if (filterList == null) filterList = new KeyCounter();
+                    else filterList.clear();
+                    cellInv.getAvailableStacks(filterList);
+                    filterSuccess = filterList.filterMatchesPrecise(srcList, dstList);
+                }
+                if (filterSuccess) {
+                    if (!dstList.isEmpty()) {
+                        for (var entry : dstList) {
+                            var what = entry.getKey();
+                            var totalStackSize = entry.getLongValue();
+                            if (totalStackSize > 0) {
+                                var movable = Math.min(totalStackSize, itemsToMove);
+                                var cellMovedItems = transferEntryToCell(what, networkInv, cellInv, movable, energy,
+                                        this.mySrc);
+                                if (cellMovedItems < 0) continue;   // Negative value indicates the source couldn't extract anything.
+                                itemsToMove -= cellMovedItems;
+                                var movedAnyItem = cellMovedItems > 0 ? 1L : 0;
+                                movedTypes += movedAnyItem;
+                                cellFlags |= movedAnyItem << slot;
                                 var status = cellInv.getStatus();
                                 if (status == CellState.FULL) {
-                                    isUrgent |= this.moveSlot(cell.getIntKey());
-                                    whitelistedCells.remove(i);
+                                    isUrgent |= this.moveSlot(slot);
+                                    filteredCells.remove(i);
+                                    cellRemoved = true;
+                                    break;
+                                } else if ((!typeFiltered && status == CellState.TYPES_FULL)
+                                        || itemsToMove <= 0 || movedTypes >= TRANSFER_TYPES_PER_TICK) {
+                                    // Postpone to the next tick
+                                    filteredCells.remove(i);
+                                    cellRemoved = true;
                                     break;
                                 }
                             }
-                            if (itemsToMove <= 0 || movedTypes >= TRANSFER_TYPES_PER_TICK)
-                                break;
                         }
+                        dstList.clear();
                     }
-                    dstList.clear();
-                    i++;
                 } else {
-                    cells.add(new AbstractInt2ObjectMap.BasicEntry<>(slot, cellInv));
-                    whitelistedCells.remove(i);
+                    filteredCells.remove(i);
+                    cells.add(cell);
+                    continue;
                 }
+                i += cellRemoved ? 0 : 1;
+            }
+            if (!filteredCells.isEmpty()) {
+                checkedCells = filteredCells;
             }
         }
-        var cellsChecked = itemsToMove > 0 && movedTypes < TRANSFER_TYPES_PER_TICK;
-        if (!cells.isEmpty()) {
+        if (itemsToMove > 0 && movedTypes < TRANSFER_TYPES_PER_TICK && !cells.isEmpty()) {
             // This avoids checking the same key multiple times
             var srcIterator = srcList.iterator();
             while (srcIterator.hasNext() && itemsToMove > 0 && movedTypes < TRANSFER_TYPES_PER_TICK
@@ -483,112 +506,50 @@ public class IOPortBlockEntity extends AENetworkedInvBlockEntity
                 if (totalStackSize > 0) {
                     var what = srcEntry.getKey();
                     var movable = Math.min(totalStackSize, itemsToMove);
-                    long movedItems = 0;
+                    long movedAnyItem = 0;
                     int x = 0;
-                    do {
+                    while (movable > 0 && x < cells.size()) {
                         var cell = cells.get(x);
+                        var slot = cell.getIntKey();
                         var cellInv = cell.getValue();
                         var cellMovedItems = transferEntryToCell(what, networkInv, cellInv, movable, energy,
                                 this.mySrc);
+                        if (cellMovedItems < 0) break;  // Negative value indicates the source couldn't extract anything.
                         movable -= cellMovedItems;
-                        movedItems += cellMovedItems;
-                        if (cellMovedItems > 0) {
-                            int slot = cell.getIntKey();
-                            cellFlags |= 1L << slot;
-                            var status = cellInv.getStatus();
-                            if (status == CellState.FULL) {
-                                isUrgent |= this.moveSlot(slot);
-                                cells.remove(x);
-                                continue;
-                            } else if (status == CellState.TYPES_FULL) {
-                                // Postpone to the next tick
-                                cells.remove(x);
-                                continue;
-                            }
+                        itemsToMove -= cellMovedItems;
+                        long cellMovedAnyItem = cellMovedItems > 0 ? 1L : 0;
+                        movedAnyItem |= cellMovedAnyItem;
+                        cellFlags |= cellMovedAnyItem << slot;
+                        var status = cellInv.getStatus();
+                        if (status == CellState.FULL) {
+                            isUrgent |= this.moveSlot(slot);
+                            cells.remove(x);
+                            continue;
+                        } else if (status == CellState.TYPES_FULL
+                                || itemsToMove <= 0 || movedTypes + movedAnyItem >= TRANSFER_TYPES_PER_TICK) {
+                            // Postpone to the next tick
+                            cells.remove(x);
+                            continue;
                         }
                         x++;
-                    } while (movable > 0 && x < cells.size());
-                    itemsToMove -= movedItems;
-                    movedTypes += movedItems > 0 ? 1 : 0;
+                    }
+                    movedTypes += movedAnyItem;
                 }
             }
-        }
-        var typeFilledCellsChecked = itemsToMove > 0 && movedTypes < TRANSFER_TYPES_PER_TICK;
-        if (!typeFilledCells.isEmpty()) {
-            if (dstList == null)
-                dstList = new KeyCounter();
-            else
-                dstList.clear();
-            var filterList = new KeyCounter();
-            int i = 0;
-            while (itemsToMove > 0 && movedTypes < TRANSFER_TYPES_PER_TICK && i < typeFilledCells.size()) {
-                var cell = typeFilledCells.get(i);
-                var slot = cell.getIntKey();
-                var cellInv = cell.getValue();
-                boolean cellRemoved = false;
-                cellInv.getAvailableStacks(filterList);
-                if (filterList.filterMatchesPrecise(srcList, dstList)) {
-                    if (!dstList.isEmpty()) {
-                        for (var entry : dstList) {
-                            var what = entry.getKey();
-                            var totalStackSize = entry.getLongValue();
-                            if (totalStackSize > 0) {
-                                var movable = Math.min(totalStackSize, itemsToMove);
-                                var cellMovedItems = transferEntryToCell(what, networkInv, cellInv, movable, energy,
-                                        this.mySrc);
-                                itemsToMove -= cellMovedItems;
-                                movedTypes += cellMovedItems > 0 ? 1 : 0;
-                                if (cellMovedItems > 0) {
-                                    cellFlags |= 1L << slot;
-                                    var status = cellInv.getStatus();
-                                    if (status == CellState.FULL) {
-                                        isUrgent |= this.moveSlot(slot);
-                                        typeFilledCells.remove(i);
-                                        cellRemoved = true;
-                                        break;
-                                    }
-                                }
-                                if (itemsToMove <= 0 || movedTypes >= TRANSFER_TYPES_PER_TICK)
-                                    break;
-                            }
-                        }
-                        dstList.clear();
-                    } else {
-                        isUrgent |= this.moveSlot(slot);
-                        typeFilledCells.remove(i);
-                    }
+            if (!cells.isEmpty()) {
+                if (checkedCells == null) {
+                    checkedCells = cells;
+                } else {
+                    checkedCells.addAll(cells);
                 }
-                i += cellRemoved ? 0 : 1;
             }
         }
         isUrgent |= itemsToMove <= 0;
         var fullnessMode = manager.getSetting(Settings.FULLNESS_MODE);
         var checkFullnessMode = itemsToMove > 0 && movedTypes < TRANSFER_TYPES_PER_TICK;
         if (fullnessMode != FullnessMode.FULL) {
-            if (!whitelistedCells.isEmpty()) {
-                for (var cell : whitelistedCells) {
-                    int slot = cell.getIntKey();
-                    var p = 1L << slot;
-                    if ((cellFlags & p) == 0
-                            || (checkFullnessMode && matchesFullnessMode(cell.getValue(), fullnessMode))) {
-                        isUrgent |= this.moveSlot(slot);
-                    }
-                    cellFlags &= ~p;
-                }
-            }
-            if (cellsChecked && !cells.isEmpty()) {
-                for (var cell : cells) {
-                    int slot = cell.getIntKey();
-                    var p = 1L << slot;
-                    if ((cellFlags & p) == 0
-                            || (checkFullnessMode && matchesFullnessMode(cell.getValue(), fullnessMode))) {
-                        isUrgent |= this.moveSlot(slot);
-                    }
-                    cellFlags &= ~p;
-                }
-            }
-            if (typeFilledCellsChecked && !typeFilledCells.isEmpty()) {
-                for (var cell : typeFilledCells) {
+            if (checkedCells != null && !checkedCells.isEmpty()) {
+                for (var cell : checkedCells) {
                     int slot = cell.getIntKey();
                     var p = 1L << slot;
                     if ((cellFlags & p) == 0
